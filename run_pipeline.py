@@ -4,7 +4,8 @@ Usage:
   python run_pipeline.py --voice narration.mp3 --out final.mp4 [--workdir work/]
 
 Steps: transcribe (word timestamps) -> Gemini/heuristic scene plan ->
-       asset fetch (Noun Project / Unsplash / Openverse / local maps) ->
+       asset fetch (Noun Project / Unsplash / Openverse / local maps /
+                    stock video) ->
        render (1080x1920) -> audio mix (voice + music + whoosh, ducking).
 """
 
@@ -64,6 +65,100 @@ def resolve_icon_assets(scenes):
             sc["bg"] = {"type": "plain"}
 
 
+def _valid_image(path):
+    """PIL se verify karo ke ye asli image hai."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
+def resolve_photo_assets(scenes):
+    """Har photo scene ke liye Unsplash -> Openverse se JPG lao."""
+    try:
+        from pipeline import assets_unsplash, assets_openverse
+    except Exception as e:
+        print(f"[assets] photo modules import failed ({e}) — photos skip")
+        assets_unsplash = assets_openverse = None
+
+    for sc in scenes:
+        bg = sc.get("bg") or {}
+        if bg.get("type") != "photo":
+            continue
+        q = bg.get("query") or "city"
+        dest = os.path.join(CACHE, "photos", slugify(q) + ".jpg")
+        got = None
+        if os.path.isfile(dest) and _valid_image(dest):
+            got = dest
+        if not got and assets_unsplash:
+            try:
+                res = assets_unsplash.search_photos(q, per_page=3)
+                if res:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    if assets_unsplash.download_photo(res[0]["url"], dest) \
+                            and _valid_image(dest):
+                        got = dest
+                    else:
+                        try:
+                            os.remove(dest)
+                        except OSError:
+                            pass
+            except Exception as e:
+                print(f"[assets] unsplash '{q}' failed: {e}")
+        if not got and assets_openverse:
+            try:
+                res = assets_openverse.search_images(q, page_size=3)
+                if res:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    if assets_openverse.download_image(res[0]["url"], dest) \
+                            and _valid_image(dest):
+                        got = dest
+                    else:
+                        try:
+                            os.remove(dest)
+                        except OSError:
+                            pass
+            except Exception as e:
+                print(f"[assets] openverse '{q}' failed: {e}")
+        if got:
+            bg["path"] = got
+        else:
+            print(f"[assets] no photo for '{q}' @{sc['start']:.1f}s — plain")
+            sc["bg"] = {"type": "plain"}
+
+
+def resolve_video_assets(scenes):
+    """Har video scene ke liye stock clip lao (Pexels->Pixabay->Coverr)."""
+    try:
+        from pipeline import assets_stock
+    except Exception as e:
+        print(f"[assets] assets_stock import failed ({e}) — videos skip")
+        assets_stock = None
+
+    for sc in scenes:
+        bg = sc.get("bg") or {}
+        if bg.get("type") != "video":
+            continue
+        q = bg.get("query") or "city"
+        dest = os.path.join(CACHE, "videos", slugify(q) + ".mp4")
+        got = None
+        if os.path.isfile(dest):
+            got = dest
+        if not got and assets_stock:
+            try:
+                got = assets_stock.fetch_video(q, dest)
+            except Exception as e:
+                print(f"[assets] stock video '{q}' failed: {e}")
+        if got:
+            bg["path"] = got
+        else:
+            print(f"[assets] no video for '{q}' @{sc['start']:.1f}s — plain")
+            sc["bg"] = {"type": "plain"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", required=True)
@@ -93,8 +188,10 @@ def main():
     with open(os.path.join(a.workdir, "scenes.json"), "w") as f:
         json.dump(plan, f, indent=1)
 
-    print("[3/5] fetching icon assets…")
+    print("[3/5] fetching icon/photo/video assets…")
     resolve_icon_assets(scenes)
+    resolve_photo_assets(scenes)
+    resolve_video_assets(scenes)
 
     print("[4/5] rendering video…")
     from pipeline import render
