@@ -1,7 +1,7 @@
 """Frame renderer for the IconVideo tool.
 
 Recreates the TikTok map/icon explainer style: flat vector art on a 1080x1920
-(9:16) canvas at 30 fps, off-white background, kinetic word-by-word text.
+(9:16) canvas at 24 fps, off-white background, kinetic word-by-word text.
 
 Scene format (list of dicts):
     {"start": float, "end": float,
@@ -29,6 +29,35 @@ import subprocess
 import tempfile
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+
+import numpy as np
+
+# --- speed caches: polygons numpy me ek dafa convert, flags resize ek dafa ---
+_np_table_cache = {}   # id(countries) -> {code: {"rings": [float64 (N,2)], "bbox": (4,)}}
+_wide_cache = {}
+_flag_cache = {}
+
+
+def _get_np_table(countries):
+    key = id(countries)
+    table = _np_table_cache.get(key)
+    if table is None:
+        table = {}
+        for code, c in countries.items():
+            rings = []
+            for ring in c["polys"]:
+                a = np.asarray(ring, dtype=np.float64)
+                if len(a) >= 3:
+                    rings.append(a)
+            if rings:
+                allp = np.vstack(rings)
+                table[code] = {
+                    "rings": rings,
+                    "bbox": (float(allp[:, 0].min()), float(allp[:, 1].min()),
+                             float(allp[:, 0].max()), float(allp[:, 1].max())),
+                }
+        _np_table_cache[key] = table
+    return table
 
 # ---------------------------------------------------------------- constants
 W, H = 1080, 1920
@@ -205,11 +234,14 @@ def camera_bbox(bg, countries, p):
         b0 = _tight_bbox(countries, focus[0])
         b1 = _tight_bbox(countries, focus[-1])
     else:
-        all_boxes = [country_bbox(c) for c in countries.values()]
-        wide = _pad_bbox((
-            min(b[0] for b in all_boxes), min(b[1] for b in all_boxes),
-            max(b[2] for b in all_boxes), max(b[3] for b in all_boxes),
-        ), 0.12)
+        wide = _wide_cache.get(id(countries))
+        if wide is None:
+            all_boxes = [country_bbox(c) for c in countries.values()]
+            wide = _pad_bbox((
+                min(b[0] for b in all_boxes), min(b[1] for b in all_boxes),
+                max(b[2] for b in all_boxes), max(b[3] for b in all_boxes),
+            ), 0.12)
+            _wide_cache[id(countries)] = wide
         tight = _tight_bbox(countries, focus[0]) if focus else None
         if tight is None:
             return wide
@@ -230,49 +262,66 @@ def paste_flag(img, alpha2, cx, cy, width=120):
     """Paste assets/maps/flags/<alpha2>.png at (cx, cy); skip if missing."""
     if not alpha2:
         return
-    path = os.path.join(FLAGS_DIR, "%s.png" % alpha2.lower())
-    if not os.path.exists(path):
-        return
-    try:
-        flag = Image.open(path).convert("RGBA")
-    except OSError:
-        return
-    h = int(flag.height * width / max(flag.width, 1))
-    flag = flag.resize((width, h), Image.LANCZOS)
-    img.paste(flag, (int(cx - width / 2), int(cy - h / 2)), flag)
+    key = (alpha2.lower(), width)
+    flag = _flag_cache.get(key)
+    if flag is None:
+        path = os.path.join(FLAGS_DIR, "%s.png" % alpha2.lower())
+        if not os.path.exists(path):
+            return
+        try:
+            f = Image.open(path).convert("RGBA")
+        except OSError:
+            return
+        h = int(f.height * width / max(f.width, 1))
+        flag = f.resize((width, h), Image.LANCZOS)
+        _flag_cache[key] = flag
+    img.paste(flag, (int(cx - width / 2), int(cy - flag.height / 2)), flag)
 
 
 def draw_map(img, bg, countries, p):
     draw = ImageDraw.Draw(img)
     bbox = camera_bbox(bg, countries, p)
+    minlon, minlat, maxlon, maxlat = bbox
+    s = W / max(maxlon - minlon, 1e-6)
+    midlat = (minlat + maxlat) / 2.0
     highlight = bg.get("highlight", {}) or {}
     labels = bg.get("labels", {}) or {}
     show_flags = bg.get("flags", False)
+    table = _get_np_table(countries)
+    half_h = H / 2.0
 
-    for code, c in countries.items():
-        polys = []
-        for ring in c["polys"]:
-            pts = [project(lon, lat, bbox, W, H) for lon, lat in ring]
-            if len(pts) >= 3:
-                polys.append(pts)
+    def proj(a):
+        """(N,2) lon/lat -> list of (x, y) int pixels."""
+        x = (a[:, 0] - minlon) * s
+        y = half_h - (a[:, 1] - midlat) * s
+        return np.stack([x, y], axis=1).astype(np.int32).tolist()
+
+    for code, entry in table.items():
+        cb = entry["bbox"]
+        # screen se bahar mulk skip karo — zoomed scenes me bara speedup
+        if cb[2] < minlon or cb[0] > maxlon or cb[3] < minlat or cb[1] > maxlat:
+            continue
         if code in highlight:
             fill = highlight[code]
             outline = _shade(fill, 0.72)
         else:
             fill, outline = GRAY_FILL, GRAY_LINE
-        for poly in polys:
-            draw.polygon(poly, fill=fill, outline=outline, width=3)
+        for a in entry["rings"]:
+            pts = proj(a)
+            if len(pts) >= 3:
+                draw.polygon(pts, fill=fill, outline=outline, width=3)
 
     for code in highlight:
-        c = countries.get(code)
-        if not c:
+        entry = table.get(code)
+        if not entry:
             continue
         xs, ys = [], []
-        for ring in c["polys"]:
-            for lon, lat in ring:
-                x, y = project(lon, lat, bbox, W, H)
-                xs.append(x)
-                ys.append(y)
+        for a in entry["rings"]:
+            pts = proj(a)
+            xs.extend(px for px, _ in pts)
+            ys.extend(py for _, py in pts)
+        if not xs:
+            continue
         # skip flag/label when the country is fully off-screen
         if max(xs) < 0 or min(xs) > W or max(ys) < 0 or min(ys) > H:
             continue
@@ -469,28 +518,40 @@ def render_frame(scene, t, countries=None):
 
 def _encode_frames(pattern, out_mp4, fps):
     cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern,
-           "-c:v", "libx264", "-pix_fmt", "yuv420p", out_mp4]
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+           "-pix_fmt", "yuv420p", out_mp4]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + r.stderr[-2000:])
 
 
+def _pipe_encoder(seg_mp4, fps):
+    """ffmpeg subprocess jo raw RGB24 frames stdin se le kar mp4 banaye."""
+    cmd = ["ffmpeg", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "%dx%d" % (W, H),
+           "-framerate", str(fps), "-i", "-",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+           "-pix_fmt", "yuv420p", seg_mp4]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _render_pil_segment(scene, seg_mp4, countries, tmp, si, fps):
-    """map/icons/plain/photo scene -> PIL frames -> silent mp4 segment."""
+    """map/icons/plain/photo scene -> PIL frames seedha ffmpeg pipe -> mp4."""
     n = max(1, int(round((scene["end"] - scene["start"]) * fps)))
-    for i in range(n):
-        t = scene["start"] + i / fps
-        frame = render_frame(scene, t, countries)
-        frame.convert("RGB").save(
-            os.path.join(tmp, "p%02d_%04d.png" % (si, i)))
+    proc = _pipe_encoder(seg_mp4, fps)
     try:
-        _encode_frames(os.path.join(tmp, "p%02d_%%04d.png" % si), seg_mp4, fps)
+        for i in range(n):
+            t = scene["start"] + i / fps
+            frame = render_frame(scene, t, countries)
+            proc.stdin.write(frame.convert("RGB").tobytes())
     finally:
-        for fp in glob.glob(os.path.join(tmp, "p%02d_*.png" % si)):
-            try:
-                os.remove(fp)
-            except OSError:
-                pass
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+    if proc.wait() != 0:
+        raise RuntimeError("ffmpeg pipe encode failed")
 
 
 def _render_video_segment(scene, seg_mp4, tmp, si, fps):
@@ -511,22 +572,28 @@ def _render_video_segment(scene, seg_mp4, tmp, si, fps):
         scene["bg"] = {"type": "plain"}
         _render_pil_segment(scene, seg_mp4, None, tmp, si, fps)
         return
-    for idx, fp in enumerate(frames):
-        T = scene["start"] + idx / fps
-        im = Image.open(fp).convert("RGBA")
-        im = draw_text(im, words, T)
-        im.convert("RGB").save(fp)
+    proc = _pipe_encoder(seg_mp4, fps)
     try:
-        _encode_frames(pat, seg_mp4, fps)
+        for idx, fp in enumerate(frames):
+            T = scene["start"] + idx / fps
+            im = Image.open(fp).convert("RGBA")
+            im = draw_text(im, words, T)
+            proc.stdin.write(im.convert("RGB").tobytes())
     finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
         for fp in glob.glob(os.path.join(tmp, "v%02d_*.png" % si)):
             try:
                 os.remove(fp)
             except OSError:
                 pass
+    if proc.wait() != 0:
+        raise RuntimeError("ffmpeg pipe encode failed (video bg)")
 
 
-def render_scenes(scenes, out_mp4, fps=30):
+def render_scenes(scenes, out_mp4, fps=24):
     """Render each scene to a silent mp4 segment, then concat to out_mp4.
 
     Scene bg types map/icons/plain/photo render via PIL; video scenes trim
