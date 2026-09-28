@@ -28,7 +28,11 @@ def slugify(s):
 
 
 def resolve_icon_assets(scenes):
-    """Har icon item ke liye Noun Project se PNG lao; fail ho to plain scene."""
+    """Har icon item ke liye Noun Project se PNG lao.
+
+    Kuch na mile to item rehne do — renderer placeholder tile banata hai.
+    Koi scene blank nahi rehta.
+    """
     try:
         from pipeline import assets_noun
     except Exception as e:
@@ -58,11 +62,14 @@ def resolve_icon_assets(scenes):
             if got:
                 item["path"] = got
                 ok_items.append(item)
-        if ok_items:
-            bg["items"] = ok_items
-        else:
-            print(f"[assets] no icons for scene @{sc['start']:.1f}s — plain")
-            sc["bg"] = {"type": "plain"}
+        n_total = len(bg.get("items") or [])
+        if not n_total:
+            bg["items"] = [{"query": "idea", "label": "Idea"}]
+            n_total = 1
+        for item in bg["items"]:
+            item.setdefault("path", None)
+        print(f"[assets] icons scene @{sc['start']:.1f}s: "
+              f"{len(ok_items)}/{n_total} real icons")
 
 
 def _valid_image(path):
@@ -125,9 +132,12 @@ def resolve_photo_assets(scenes):
                 print(f"[assets] openverse '{q}' failed: {e}")
         if got:
             bg["path"] = got
+            print(f"[assets] photo '{q}' @{sc['start']:.1f}s OK")
         else:
-            print(f"[assets] no photo for '{q}' @{sc['start']:.1f}s — plain")
-            sc["bg"] = {"type": "plain"}
+            # photo na mile to icons scene bana do — blank kabhi nahi
+            print(f"[assets] no photo for '{q}' @{sc['start']:.1f}s — icons fallback")
+            sc["bg"] = {"type": "icons",
+                        "items": [{"query": q, "label": q.title()[:24]}]}
 
 
 def resolve_video_assets(scenes):
@@ -154,9 +164,37 @@ def resolve_video_assets(scenes):
                 print(f"[assets] stock video '{q}' failed: {e}")
         if got:
             bg["path"] = got
+            print(f"[assets] video '{q}' @{sc['start']:.1f}s OK")
         else:
-            print(f"[assets] no video for '{q}' @{sc['start']:.1f}s — plain")
-            sc["bg"] = {"type": "plain"}
+            print(f"[assets] no video for '{q}' @{sc['start']:.1f}s — icons fallback")
+            sc["bg"] = {"type": "icons",
+                        "items": [{"query": q, "label": q.title()[:24]}]}
+
+
+def ensure_visuals(scenes):
+    """Aakhri safety: jo scene ab bhi 'plain' hai use icons scene banao.
+
+    Planner ka 'plain' (last resort) bhi blank nahi rehta — scene ke alfaaz
+    se icon queries banao; na mile to placeholder tiles render honge.
+    """
+    from pipeline.planner import _content_words
+    changed = False
+    for sc in scenes:
+        bg = sc.get("bg") or {}
+        if bg.get("type") != "plain":
+            continue
+        words = [{"w": w["w"]} for w in (sc.get("text") or [])]
+        cws = _content_words(words)[:3]
+        items = [{"query": cw.replace("_", " "),
+                  "label": cw.replace("_", " ").title()[:24]} for cw in cws]
+        if not items:
+            items = [{"query": "idea", "label": "Idea"}]
+        sc["bg"] = {"type": "icons", "items": items}
+        changed = True
+        print(f"[assets] plain @{sc['start']:.1f}s -> icons "
+              f"{[i['query'] for i in items]}")
+    if changed:
+        resolve_icon_assets(scenes)
 
 
 def main():
@@ -189,20 +227,31 @@ def main():
         json.dump(plan, f, indent=1)
 
     print("[3/5] fetching icon/photo/video assets…")
-    resolve_icon_assets(scenes)
     resolve_photo_assets(scenes)
     resolve_video_assets(scenes)
+    resolve_icon_assets(scenes)
+    ensure_visuals(scenes)  # koi scene blank nahi rehta
+    for i, sc in enumerate(scenes):
+        print(f"      scene {i}: {sc['start']:.1f}-{sc['end']:.1f}s "
+              f"-> {(sc.get('bg') or {}).get('type')}")
 
     print("[4/5] rendering video…")
     from pipeline import render
     silent = os.path.join(a.workdir, "silent.mp4")
     render.render_scenes(scenes, silent, fps=24)
 
-    print("[5/5] mixing audio…")
-    events = []
+    print("[5/5] audio: Gemini sound design + mix…")
+    music_spec, gem_events = assemble.plan_audio(
+        tr["words"], duration, gkey)
+    print(f"      mood={music_spec.get('mood', '?')} "
+          f"{music_spec.get('key', '?')}-{music_spec.get('mode', '?')} "
+          f"@{music_spec.get('bpm', '?')}bpm, {len(gem_events)} sfx")
+    events = list(gem_events)
     for sc in scenes:
         if sc["start"] > 0.15:
-            events.append((sc["start"], "whoosh"))
+            # structural whoosh — sirf tab jab Gemini ne paas me koi sfx na diya ho
+            if not any(abs(t - sc["start"]) < 0.8 for t, _ in events):
+                events.append((sc["start"], "whoosh"))
         bg = sc.get("bg") or {}
         if bg.get("type") == "icons":
             for k in range(len(bg.get("items", []))):
@@ -211,7 +260,7 @@ def main():
     music = os.path.join(a.workdir, "music.m4a")
     sfx = os.path.join(a.workdir, "sfx.m4a")
     assemble.convert_audio(a.voice, voice_wav, duration)
-    assemble.make_ambient_music(duration, music)
+    assemble.make_mood_music(duration, music_spec, music)
     assemble.build_sfx_bed(events, sfx, duration)
     assemble.mix_final(silent, voice_wav, music, sfx, a.out, duration,
                        music_vol=a.music_vol, sfx_vol=a.sfx_vol)
