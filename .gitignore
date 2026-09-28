@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+work*/
+test_*.mp4
+assets/cache/
+models/
