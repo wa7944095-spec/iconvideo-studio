@@ -13,14 +13,18 @@ bg types:
      "labels": {"PAK": "Pakistan"}, "flags": True, "zoom": "in"|"out"|"pan"}
     {"type": "icons", "items": [{"path": "/abs/icon.png",
                                  "label": "Worker", "callout": "Thousands"}, ...]}
+    {"type": "photo", "path": "/abs/photo.jpg", "kenburns": "in"|"out"}
+    {"type": "video", "path": "/abs/clip.mp4"}
     {"type": "plain"}
 
 No side effects on import. No secrets involved.
 """
 
+import glob
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -364,6 +368,40 @@ def draw_icons(img, bg, t_scene):
                       label, font=font, fill=TEXT_GRAY)
 
 
+# ---------------------------------------------------------------- photo bg
+_photo_cache = {}
+
+
+def _load_photo(path):
+    """Cover-fit photo with ~12% headroom for the Ken Burns zoom."""
+    if path in _photo_cache:
+        return _photo_cache[path]
+    img = Image.open(path).convert("RGB")
+    s = max(W / img.width, H / img.height) * 1.12
+    img = img.resize((max(1, int(img.width * s)),
+                      max(1, int(img.height * s))), Image.LANCZOS)
+    _photo_cache[path] = img
+    return img
+
+
+def draw_photo(img, bg, p):
+    """Full-bleed photo, cover-fit, slow Ken Burns zoom. Missing file -> skip."""
+    path = bg.get("path")
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        base = _load_photo(path)
+    except OSError:
+        return
+    kb = bg.get("kenburns", "in")
+    z = 1.0 + 0.08 * (p if kb == "in" else 1.0 - p)
+    bw, bh = base.width, base.height
+    zw, zh = max(1, int(bw / 1.12 / z)), max(1, int(bh / 1.12 / z))
+    x0, y0 = (bw - zw) // 2, (bh - zh) // 2
+    crop = base.crop((x0, y0, x0 + zw, y0 + zh)).resize((W, H), Image.LANCZOS)
+    img.paste(crop.convert("RGBA"), (0, 0))
+
+
 # ---------------------------------------------------------------- text overlay
 def draw_text(img, words, T):
     """Kinetic text: words appear at their timestamp, stay till scene end."""
@@ -397,6 +435,9 @@ def draw_text(img, words, T):
         for w, t in line:
             alpha = int(255 * min(1.0, max(0.0, (T - t) / 0.12)))
             if alpha > 0:
+                # halka sa shadow taake photo/video background par bhi parha jaye
+                d.text((x + 3, y + 3), w, font=font,
+                       fill=(0, 0, 0, int(alpha * 0.35)))
                 d.text((x, y), w, font=font,
                        fill=(85, 85, 85, alpha))
             x += meas.textbbox((0, 0), w + " ", font=font)[2]
@@ -419,28 +460,102 @@ def render_frame(scene, t, countries=None):
         draw_map(img, bg, countries, p)
     elif btype == "icons":
         draw_icons(img, bg, t_scene)
-    # "plain": empty background
+    elif btype == "photo":
+        draw_photo(img, bg, p)
+    # "plain": empty background; "video" is handled per-segment in render_scenes
     img = draw_text(img, scene.get("text", []) or [], t)
     return img
 
 
-def render_scenes(scenes, out_mp4, fps=30):
-    """Render all scenes to PNG frames, then encode with ffmpeg to out_mp4."""
-    countries = load_countries()
-    tmp = tempfile.mkdtemp(prefix="iconvideo_")
-    idx = 0
-    for s in scenes:
-        n = max(1, int(round((s["end"] - s["start"]) * fps)))
-        for i in range(n):
-            t = s["start"] + i / fps
-            frame = render_frame(s, t, countries)
-            frame.convert("RGB").save(
-                os.path.join(tmp, "frame_%04d.png" % idx))
-            idx += 1
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i",
-           os.path.join(tmp, "frame_%04d.png"),
+def _encode_frames(pattern, out_mp4, fps):
+    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern,
            "-c:v", "libx264", "-pix_fmt", "yuv420p", out_mp4]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + r.stderr[-2000:])
-    return out_mp4
+
+
+def _render_pil_segment(scene, seg_mp4, countries, tmp, si, fps):
+    """map/icons/plain/photo scene -> PIL frames -> silent mp4 segment."""
+    n = max(1, int(round((scene["end"] - scene["start"]) * fps)))
+    for i in range(n):
+        t = scene["start"] + i / fps
+        frame = render_frame(scene, t, countries)
+        frame.convert("RGB").save(
+            os.path.join(tmp, "p%02d_%04d.png" % (si, i)))
+    try:
+        _encode_frames(os.path.join(tmp, "p%02d_%%04d.png" % si), seg_mp4, fps)
+    finally:
+        for fp in glob.glob(os.path.join(tmp, "p%02d_*.png" % si)):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+
+def _render_video_segment(scene, seg_mp4, tmp, si, fps):
+    """video scene: ffmpeg trims/scales the stock clip, PIL overlays text."""
+    bg = scene["bg"]
+    path = bg.get("path")
+    dur = max(scene["end"] - scene["start"], 0.5)
+    words = scene.get("text", []) or []
+    pat = os.path.join(tmp, "v%02d_%%04d.png" % si)
+    vf = ("scale=1080:1920:force_original_aspect_ratio=increase,"
+          "crop=1080:1920,fps=%d" % fps)
+    cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", path,
+           "-t", "%.3f" % dur, "-vf", vf, pat]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    frames = sorted(glob.glob(os.path.join(tmp, "v%02d_*.png" % si)))
+    if r.returncode != 0 or not frames:
+        # corrupt/short clip -> downgrade to plain PIL segment
+        scene["bg"] = {"type": "plain"}
+        _render_pil_segment(scene, seg_mp4, None, tmp, si, fps)
+        return
+    for idx, fp in enumerate(frames):
+        T = scene["start"] + idx / fps
+        im = Image.open(fp).convert("RGBA")
+        im = draw_text(im, words, T)
+        im.convert("RGB").save(fp)
+    try:
+        _encode_frames(pat, seg_mp4, fps)
+    finally:
+        for fp in glob.glob(os.path.join(tmp, "v%02d_*.png" % si)):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+
+def render_scenes(scenes, out_mp4, fps=30):
+    """Render each scene to a silent mp4 segment, then concat to out_mp4.
+
+    Scene bg types map/icons/plain/photo render via PIL; video scenes trim
+    the stock clip with ffmpeg and overlay kinetic text per frame.
+    """
+    countries = load_countries()
+    tmp = tempfile.mkdtemp(prefix="iconvideo_")
+    try:
+        segments = []
+        for si, s in enumerate(scenes):
+            seg = os.path.join(tmp, "seg_%02d.mp4" % si)
+            bg = s.get("bg") or {}
+            if (bg.get("type") == "video" and bg.get("path")
+                    and os.path.isfile(bg["path"])):
+                _render_video_segment(s, seg, tmp, si, fps)
+            else:
+                if bg.get("type") == "video":
+                    s["bg"] = {"type": "plain"}  # missing clip -> plain
+                _render_pil_segment(s, seg, countries, tmp, si, fps)
+            segments.append(seg)
+        lst = os.path.join(tmp, "concat.txt")
+        with open(lst, "w") as f:
+            for seg in segments:
+                f.write("file '%s'\n" % seg)
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+               "-c", "copy", out_mp4]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("ffmpeg concat failed:\n" + r.stderr[-2000:])
+        return out_mp4
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

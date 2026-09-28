@@ -7,6 +7,8 @@ Scene schema (renderer isi par chalta hai):
           "flags": true, "zoom": "in"}
       | {"type": "icons", "items": [{"query": "construction worker",
           "label": "Worker", "callout": null}, ...]}
+      | {"type": "photo", "query": "city skyline", "kenburns": "in"}
+      | {"type": "video", "query": "construction site"}
       | {"type": "plain"},
   "text": [{"w": "Pakistan", "t": 0.2}, ...]   # t = absolute seconds
 }
@@ -88,6 +90,8 @@ OUTPUT: strict JSON only, no markdown, no commentary:
 {{"scenes": [{{"start": 0.0, "end": 2.5,
   "bg": {{"type": "map", "focus": ["PAK"], "zoom": "in"}}
        | {{"type": "icons", "items": [{{"query": "construction worker", "label": "Worker", "callout": null}}]}}
+       | {{"type": "photo", "query": "city skyline", "kenburns": "in"}}
+       | {{"type": "video", "query": "construction site"}}
        | {{"type": "plain"}},
   "text": [{{"w": "Pakistan", "t": 0.2}}]}}]}}
 
@@ -96,9 +100,12 @@ RULES:
 - "text" = EXACT words spoken in [start,end], with their timestamps (absolute seconds).
 - Use "map" bg whenever a country is named. focus = ISO3 codes. Known ISO3: PAK Pakistan, SAU Saudi Arabia, TUR Turkey, IND India, CHN China, USA United States, GBR United Kingdom, ARE UAE, QAT Qatar, KWT Kuwait, DEU Germany, FRA France, EGY Egypt, BGD Bangladesh, MYS Malaysia, IDN Indonesia, PHL Philippines.
 - zoom: "in" on first country scene, "pan" when the country changes, "out" rarely.
-- Otherwise use "icons" bg with 1-3 items. query = short icon search term ("construction worker", "calendar", "factory", "money", "airplane"). label = 1-2 word caption. callout = short pill text above an icon when narration mentions a quantity (e.g. "Thousands").
+- Use "icons" bg for concepts/people/objects. query = short icon search term ("construction worker", "calendar", "factory", "money", "airplane"). label = 1-2 word caption. callout = short pill text above an icon when narration mentions a quantity (e.g. "Thousands").
+- Use "photo" bg for generic visual/B-roll moments needing a real-world image (city skyline, factory floor, crowd, desert). query = short English photo search phrase. kenburns = "in" or "out".
+- Use "video" bg SPARINGLY (max 1-2 per video) for action moments that need real motion (construction site, traffic, waves). query = short English video search phrase.
 - Keep every scene visually simple: max 3 icons, max 2 countries in focus.
-- Prefer map scenes for geography/economy topics, icons for people/actions/objects.
+- Prefer map scenes for geography/economy topics, icons for people/actions/objects, photo for atmosphere, video for action.
+- "plain" is the last resort when nothing else fits.
 
 WORDS:
 {words}
