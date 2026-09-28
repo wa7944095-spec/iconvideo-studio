@@ -24,6 +24,7 @@ import glob
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -554,6 +555,31 @@ def _render_pil_segment(scene, seg_mp4, countries, tmp, si, fps):
         raise RuntimeError("ffmpeg pipe encode failed")
 
 
+_ICON_FALLBACK_STOP = frozenset(
+    "the a an and or of to in on is are was were be been it its this that "
+    "with for from as at by we you they he she him her his our your their "
+    "not no yes do does did will would can could should have has had all "
+    "out up over into than then there here when what which who how why so if "
+    "my me us very just about".split())
+
+
+def _icons_from_text(scene):
+    """Render-time safety: scene ke alfaaz se icon items (placeholder tiles)."""
+    seen, items = set(), []
+    for w in (scene.get("text") or []):
+        c = re.sub(r"[^a-zA-Z']", "", w.get("w", "")).lower()
+        if len(c) > 3 and c not in _ICON_FALLBACK_STOP and c not in seen:
+            seen.add(c)
+            items.append({"query": c, "label": c.title()[:24], "path": None})
+        if len(items) == 3:
+            break
+    return items or [{"query": "idea", "label": "Idea", "path": None}]
+
+
+def _downgrade_to_icons(scene):
+    scene["bg"] = {"type": "icons", "items": _icons_from_text(scene)}
+
+
 def _render_video_segment(scene, seg_mp4, tmp, si, fps):
     """video scene: ffmpeg trims/scales the stock clip, PIL overlays text."""
     bg = scene["bg"]
@@ -568,8 +594,8 @@ def _render_video_segment(scene, seg_mp4, tmp, si, fps):
     r = subprocess.run(cmd, capture_output=True, text=True)
     frames = sorted(glob.glob(os.path.join(tmp, "v%02d_*.png" % si)))
     if r.returncode != 0 or not frames:
-        # corrupt/short clip -> downgrade to plain PIL segment
-        scene["bg"] = {"type": "plain"}
+        # corrupt/short clip -> icons fallback (kabhi blank nahi)
+        _downgrade_to_icons(scene)
         _render_pil_segment(scene, seg_mp4, None, tmp, si, fps)
         return
     proc = _pipe_encoder(seg_mp4, fps)
@@ -611,7 +637,7 @@ def render_scenes(scenes, out_mp4, fps=24):
                 _render_video_segment(s, seg, tmp, si, fps)
             else:
                 if bg.get("type") == "video":
-                    s["bg"] = {"type": "plain"}  # missing clip -> plain
+                    _downgrade_to_icons(s)  # missing clip -> icons, blank nahi
                 _render_pil_segment(s, seg, countries, tmp, si, fps)
             segments.append(seg)
         lst = os.path.join(tmp, "concat.txt")
