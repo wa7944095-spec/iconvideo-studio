@@ -196,7 +196,7 @@ def main():
     print("[4/5] rendering video…")
     from pipeline import render
     silent = os.path.join(a.workdir, "silent.mp4")
-    render.render_scenes(scenes, silent, fps=30)
+    render.render_scenes(scenes, silent, fps=24)
 
     print("[5/5] mixing audio…")
     events = []
