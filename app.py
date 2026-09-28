@@ -26,8 +26,7 @@ with st.expander("⚙️ API keys (optional — bina keys ke bhi chalta hai)"):
     unsplash_key = st.text_input("Unsplash access key", type="password")
 
 voice = st.file_uploader(
-    "🎙️ Voice-over file upload karo",
-    type=["mp3", "wav", "m4a", "ogg", "flac"],
+    "🎙️ Voice-over file upload karo (koi bhi audio format: MP3, WAV, M4A, OGG, FLAC, WMA…)",
 )
 use_gemini = st.toggle("✨ Gemini smart scenes", value=True,
                        help="Band ho to simple rule-based planner chalega.")
@@ -51,6 +50,15 @@ if st.button("🎬 Video banao", type="primary", disabled=not voice):
     voice_path = os.path.join(workdir, "voice" + os.path.splitext(voice.name)[1])
     with open(voice_path, "wb") as f:
         f.write(voice.getbuffer())
+
+    # koi bhi format ho — check karo ke is me audio stream hai
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", voice_path],
+        capture_output=True, text=True)
+    if "audio" not in probe.stdout:
+        st.error("Ye file audio nahi lag rahi — koi audio file (MP3/WAV/M4A/…) upload karo.")
+        st.stop()
     out_path = os.path.join(workdir, "iconvideo_final.mp4")
 
     env = dict(os.environ)
